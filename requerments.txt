@@ -1,0 +1,5 @@
+google-genai
+pyaudio
+customtkinter
+python-socks[asyncio]
+pywebrtc-audio

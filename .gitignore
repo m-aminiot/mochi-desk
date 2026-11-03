@@ -1,0 +1,8 @@
+ApiToken.txt
+memory.json
+chats.json
+settings.json
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store

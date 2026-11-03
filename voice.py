@@ -1,0 +1,325 @@
+"""Gemini Live voice conversation with acoustic echo cancellation."""
+
+import asyncio
+import queue
+import threading
+
+import numpy as np
+import pyaudio
+from google import genai
+from google.genai import types
+from pywebrtc_audio import AudioProcessor
+
+from config import friendly_gemini_error, read_api_key
+from text import read_soul
+from tools import LIVE_TOOLS, execute_tool
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+DEVICE_SAMPLE_RATE = 24000
+SEND_SAMPLE_RATE = 16000
+RECEIVE_SAMPLE_RATE = 24000
+FRAME_SAMPLES = 240  # 10 ms at 24 kHz (the callback/device rate).
+SEND_FRAME_SAMPLES = 160  # 10 ms at 16 kHz (Gemini input rate).
+MODEL = "gemini-3.8-live"
+MAX_PLAYBACK_BYTES = 2 * 1024 * 1024
+
+CONFIG = types.LiveConnectConfig(
+    response_modalities=["AUDIO"],
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+        )
+    ),
+    context_window_compression=types.ContextWindowCompressionConfig(
+        trigger_tokens=104857,
+        sliding_window=types.SlidingWindow(target_tokens=52428),
+    ),
+    system_instruction=read_soul() or None,
+    tools=LIVE_TOOLS,
+)
+
+
+class VoiceSession:
+    """Runs microphone and speaker streaming in a background thread."""
+
+    def __init__(
+        self,
+        on_status=lambda message: None,
+        on_text=lambda message: None,
+        on_tool_event=lambda event: None,
+        confirm_tool=None,
+    ):
+        self.on_status = on_status
+        self.on_text = on_text
+        self.on_tool_event = on_tool_event
+        self.confirm_tool = confirm_tool
+        self._thread = None
+        self._loop = None
+        self._main_task = None
+        self._stop_requested = threading.Event()
+        self._microphone_muted = threading.Event()
+        self._microphone_frames = None
+
+    def set_microphone_muted(self, muted: bool):
+        """Mute microphone uploads while keeping the live session connected."""
+        if muted:
+            self._microphone_muted.set()
+        else:
+            self._microphone_muted.clear()
+        frames = self._microphone_frames
+        if frames is not None:
+            while True:
+                try:
+                    frames.get_nowait()
+                except queue.Empty:
+                    break
+            if muted:
+                # Wake capture_microphone if it is waiting on an empty queue.
+                try:
+                    frames.put_nowait(None)
+                except queue.Full:
+                    pass
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_requested.clear()
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_requested.set()
+        if self._loop and self._main_task:
+            self._loop.call_soon_threadsafe(self._main_task.cancel)
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._run())
+        except asyncio.CancelledError:
+            self.on_status("Voice session stopped")
+        except Exception as exc:
+            detail = friendly_gemini_error(exc)
+            self.on_status(f"Voice error: {detail[:600]}")
+
+    @classmethod
+    def _exception_messages(cls, group):
+        messages = []
+        for item in group.exceptions:
+            if isinstance(item, BaseExceptionGroup):
+                messages.extend(cls._exception_messages(item))
+            else:
+                messages.append(f"{type(item).__name__}: {item}")
+        return messages
+
+    @staticmethod
+    def _resample_24k_to_16k(data):
+        samples = np.frombuffer(data, dtype=np.int16)
+        if samples.size != FRAME_SAMPLES:
+            return np.zeros(SEND_FRAME_SAMPLES, dtype=np.int16)
+        # One 10 ms frame: linear interpolation from 24 to 16 samples/ms.
+        positions = np.arange(SEND_FRAME_SAMPLES, dtype=np.float32) * 1.5
+        return np.interp(positions, np.arange(FRAME_SAMPLES), samples).astype(np.int16)
+
+    async def _run(self):
+        self._loop = asyncio.get_running_loop()
+        self._main_task = asyncio.current_task()
+        client = genai.Client(
+            http_options={"api_version": "v1beta"},
+            api_key=read_api_key(),
+        )
+        audio = pyaudio.PyAudio()
+        input_stream = output_stream = None
+        try:
+            async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
+                self.on_status("Connected. You can speak now.")
+                input_info = audio.get_default_input_device_info()
+                playback_chunks = queue.Queue()
+                reference_frames = queue.Queue(maxsize=100)
+                microphone_frames = queue.Queue(maxsize=100)
+                self._microphone_frames = microphone_frames
+                playback_buffer = bytearray()
+                playback_lock = threading.Lock()
+                processor = AudioProcessor(
+                    sample_rate=SEND_SAMPLE_RATE,
+                    num_channels=CHANNELS,
+                    echo_cancellation=True,
+                    noise_suppression=True,
+                    auto_gain_control=True,
+                    stream_delay_ms=40,
+                )
+
+                def output_callback(_input_data, frame_count, _time_info, _status):
+                    byte_count = frame_count * 2
+                    with playback_lock:
+                        while len(playback_buffer) < byte_count:
+                            try:
+                                playback_buffer.extend(playback_chunks.get_nowait())
+                            except queue.Empty:
+                                break
+                        frame = bytes(playback_buffer[:byte_count])
+                        del playback_buffer[:byte_count]
+                    if len(frame) < byte_count:
+                        frame += b"\0" * (byte_count - len(frame))
+                    try:
+                        reference_frames.put_nowait(frame)
+                    except queue.Full:
+                        try:
+                            reference_frames.get_nowait()
+                            reference_frames.put_nowait(frame)
+                        except queue.Empty:
+                            pass
+                    return frame, pyaudio.paContinue
+
+                def input_callback(in_data, _frame_count, _time_info, _status):
+                    try:
+                        if self._microphone_muted.is_set():
+                            return None, pyaudio.paContinue
+                        try:
+                            far_data = reference_frames.get_nowait()
+                        except queue.Empty:
+                            far_data = b"\0" * (FRAME_SAMPLES * 2)
+                        near = self._resample_24k_to_16k(in_data)
+                        far = self._resample_24k_to_16k(far_data)
+                        cleaned = processor.process(near, far).tobytes()
+                        if not self._microphone_muted.is_set():
+                            # Keep the most recent microphone audio, avoiding stale
+                            # speech being submitted after an interruption.
+                            try:
+                                microphone_frames.put_nowait(cleaned)
+                            except queue.Full:
+                                try:
+                                    microphone_frames.get_nowait()
+                                    microphone_frames.put_nowait(cleaned)
+                                except queue.Empty:
+                                    pass
+                    except Exception:
+                        # Never let an audio-device callback raise into PortAudio.
+                        pass
+                    return None, pyaudio.paContinue
+
+                output_stream = audio.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=DEVICE_SAMPLE_RATE,
+                    output=True,
+                    frames_per_buffer=FRAME_SAMPLES,
+                    stream_callback=output_callback,
+                    start=False,
+                )
+                input_stream = audio.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=DEVICE_SAMPLE_RATE,
+                    input=True,
+                    input_device_index=input_info["index"],
+                    frames_per_buffer=FRAME_SAMPLES,
+                    stream_callback=input_callback,
+                    start=False,
+                )
+                output_stream.start_stream()
+                input_stream.start_stream()
+
+                incoming_audio = asyncio.Queue()
+                playback_generation = 0
+                discarding_interrupted_turn = False
+
+                async def discard_pending_audio():
+                    nonlocal playback_generation
+                    playback_generation += 1
+                    while not incoming_audio.empty():
+                        try:
+                            incoming_audio.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    while True:
+                        try:
+                            playback_chunks.get_nowait()
+                        except queue.Empty:
+                            break
+                    with playback_lock:
+                        playback_buffer.clear()
+                    while True:
+                        try:
+                            reference_frames.get_nowait()
+                        except queue.Empty:
+                            break
+
+                async def capture_microphone():
+                    while True:
+                        frame1 = await asyncio.to_thread(microphone_frames.get)
+                        if frame1 is None or self._microphone_muted.is_set():
+                            continue
+                        frame2 = await asyncio.to_thread(microphone_frames.get)
+                        if frame2 is None or self._microphone_muted.is_set():
+                            continue
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                data=frame1 + frame2,
+                                mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                            )
+                        )
+
+                async def receive_responses():
+                    nonlocal discarding_interrupted_turn
+                    while True:
+                        async for response in session.receive():
+                            if response.tool_call and response.tool_call.function_calls:
+                                function_responses = []
+                                for function_call in response.tool_call.function_calls:
+                                    result = await asyncio.to_thread(
+                                        execute_tool,
+                                        function_call.name,
+                                        function_call.args or {},
+                                        self.on_tool_event,
+                                        self.confirm_tool,
+                                    )
+                                    function_responses.append(types.FunctionResponse(
+                                        id=function_call.id,
+                                        name=function_call.name,
+                                        response=result,
+                                    ))
+                                await session.send_tool_response(
+                                    function_responses=function_responses
+                                )
+                                continue
+                            content = response.server_content
+                            if content and content.interrupted:
+                                await discard_pending_audio()
+                                discarding_interrupted_turn = not content.turn_complete
+                                continue
+                            if discarding_interrupted_turn:
+                                if content and content.turn_complete:
+                                    discarding_interrupted_turn = False
+                                continue
+                            turn = content.model_turn if content else None
+                            for part in turn.parts if turn else []:
+                                if part.inline_data and part.inline_data.data:
+                                    await incoming_audio.put(
+                                        (playback_generation, part.inline_data.data)
+                                    )
+                            if response.text:
+                                self.on_text(response.text)
+
+                async def play_responses():
+                    while True:
+                        generation, chunk = await incoming_audio.get()
+                        if generation == playback_generation:
+                            try:
+                                playback_chunks.put_nowait(chunk)
+                            except queue.Full:
+                                pass
+
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(capture_microphone())
+                    group.create_task(receive_responses())
+                    group.create_task(play_responses())
+        finally:
+            for stream in (input_stream, output_stream):
+                if stream is not None:
+                    if stream.is_active():
+                        stream.stop_stream()
+                    stream.close()
+            audio.terminate()
+            self._microphone_frames = None
+            self._loop = self._main_task = None
