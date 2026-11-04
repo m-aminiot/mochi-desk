@@ -9,8 +9,9 @@ import uuid
 from pathlib import Path
 
 from google import genai
+from google.genai import types
 
-from config import get_app_data_dir, read_api_key
+from config import API_BASE_URL, get_app_data_dir, read_api_key
 from tools import DECLARATIONS, execute_tool
 
 MODEL = "gemini-3.5-flash-lite"
@@ -48,7 +49,13 @@ def read_soul() -> str:
 
 class TextChat:
     def __init__(self):
-        self.client = genai.Client(api_key=read_api_key())
+        self.client = genai.Client(
+            api_key=read_api_key(),
+            http_options=types.HttpOptions(
+                base_url=API_BASE_URL,
+                api_version="v1beta",
+            ),
+        )
         self._lock = threading.Lock()
         self.data = self._load_data()
         self._repair_data()

@@ -21,6 +21,7 @@ def get_app_data_dir() -> Path:
 
 
 TOKEN_FILE = get_app_data_dir() / "ApiToken.txt"
+API_BASE_URL = "........."
 
 
 def friendly_gemini_error(error) -> str:

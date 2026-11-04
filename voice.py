@@ -10,7 +10,7 @@ from google import genai
 from google.genai import types
 from pywebrtc_audio import AudioProcessor
 
-from config import friendly_gemini_error, read_api_key
+from config import API_BASE_URL, friendly_gemini_error, read_api_key
 from text import read_soul
 from tools import LIVE_TOOLS, execute_tool
 
@@ -74,12 +74,6 @@ class VoiceSession:
                     frames.get_nowait()
                 except queue.Empty:
                     break
-            if muted:
-                # Wake capture_microphone if it is waiting on an empty queue.
-                try:
-                    frames.put_nowait(None)
-                except queue.Full:
-                    pass
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -125,7 +119,10 @@ class VoiceSession:
         self._loop = asyncio.get_running_loop()
         self._main_task = asyncio.current_task()
         client = genai.Client(
-            http_options={"api_version": "v1beta"},
+            http_options={
+                "api_version": "v1beta",
+                "base_url": API_BASE_URL,
+            },
             api_key=read_api_key(),
         )
         audio = pyaudio.PyAudio()
@@ -246,16 +243,43 @@ class VoiceSession:
                             break
 
                 async def capture_microphone():
+                    pending_frame = None
+                    muted_silence = b"\0" * (SEND_FRAME_SAMPLES * 2 * 2)
                     while True:
-                        frame1 = await asyncio.to_thread(microphone_frames.get)
-                        if frame1 is None or self._microphone_muted.is_set():
+                        if self._microphone_muted.is_set():
+                            pending_frame = None
+                            # Keep the Live audio stream moving while muted. Sending
+                            # silence lets server VAD finish any in-flight user turn
+                            # and keeps the session from waiting on a missing frame.
+                            await session.send_realtime_input(
+                                audio=types.Blob(
+                                    data=muted_silence,
+                                    mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                                )
+                            )
+                            await asyncio.sleep(0.02)
                             continue
-                        frame2 = await asyncio.to_thread(microphone_frames.get)
-                        if frame2 is None or self._microphone_muted.is_set():
+
+                        try:
+                            frame = microphone_frames.get_nowait()
+                        except queue.Empty:
+                            await asyncio.sleep(0.005)
+                            continue
+
+                        if self._microphone_muted.is_set():
+                            pending_frame = None
+                            continue
+                        if pending_frame is None:
+                            pending_frame = frame
+                            continue
+
+                        audio_data = pending_frame + frame
+                        pending_frame = None
+                        if self._microphone_muted.is_set():
                             continue
                         await session.send_realtime_input(
                             audio=types.Blob(
-                                data=frame1 + frame2,
+                                data=audio_data,
                                 mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
                             )
                         )
