@@ -1,4 +1,4 @@
-"""Cross-platform application launcher with no shell command evaluation."""
+"""Launch installed desktop applications without passing names through a shell."""
 
 import platform
 import configparser
@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+# Text-chat function declaration; the Live API receives the same fields without `type`.
 DECLARATION = {
     "type": "function",
     "name": "open_app",
@@ -33,7 +34,13 @@ LIVE_DECLARATION = {
 
 
 def open_app(app_name: str) -> dict:
-    """Launch an application by its name and report whether launch succeeded."""
+    """Launch a desktop application by display name and report the launch result.
+
+    The name is passed as an argument to platform launch APIs, not interpolated
+    into a shell command. Success confirms that the launch request was accepted;
+    it does not inspect the application's later health or window state.
+    """
+    # Reject malformed names and path-like input before searching or launching.
     if not isinstance(app_name, str):
         return {"success": False, "error": "app_name must be text."}
     app_name = app_name.strip()
@@ -46,9 +53,11 @@ def open_app(app_name: str) -> dict:
     ):
         return {"success": False, "error": "Enter a valid application name (1–120 characters)."}
 
+    # Select the native launcher so names can resolve through each OS's app registry.
     system = platform.system()
     try:
         if system == "Darwin":
+            # `open -a` resolves the visible macOS application name without a shell.
             result = subprocess.run(
                 ["open", "-a", app_name], capture_output=True, text=True, timeout=15, check=False
             )
@@ -56,6 +65,7 @@ def open_app(app_name: str) -> dict:
                 detail = (result.stderr or result.stdout).strip()
                 return {"success": False, "error": detail or f"Could not open {app_name}."}
         elif system == "Windows":
+            # Search Start Menu shortcuts first, then PATH and Windows registered aliases.
             start_menu_dirs = [
                 Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs",
                 Path(os.environ.get("PROGRAMDATA", "")) / "Microsoft/Windows/Start Menu/Programs",
@@ -79,6 +89,7 @@ def open_app(app_name: str) -> dict:
                     # Uses Windows ShellExecute app aliases and registered apps.
                     os.startfile(app_name)  # type: ignore[attr-defined]
         elif system == "Linux":
+            # Prefer an executable in PATH; otherwise resolve a desktop-entry display name.
             executable = shutil.which(app_name)
             if executable:
                 subprocess.Popen(
@@ -99,14 +110,17 @@ def open_app(app_name: str) -> dict:
                     for desktop_file in folder.rglob("*.desktop"):
                         parser = configparser.ConfigParser(interpolation=None)
                         try:
+                            # Disable config interpolation because desktop files use `%` field codes.
                             parser.read(desktop_file, encoding="utf-8")
                             entry = parser["Desktop Entry"]
                         except (OSError, KeyError, configparser.Error):
                             continue
                         if entry.get("Name", "").casefold() == app_name.casefold():
+                            # Hidden launchers should not be offered as regular desktop apps.
                             if entry.get("NoDisplay", "false").casefold() == "true":
                                 continue
                             command = shlex.split(entry.get("Exec", ""))
+                            # Remove standard desktop-entry placeholders before executing the launcher.
                             command = [part for part in command if not (part.startswith("%") and len(part) == 2)]
                             if command and shutil.which(command[0]):
                                 launcher = command
@@ -123,6 +137,8 @@ def open_app(app_name: str) -> dict:
         else:
             return {"success": False, "error": f"Opening applications is unsupported on {system}."}
     except (OSError, subprocess.TimeoutExpired) as exc:
+        # Convert OS launch errors into the same structured format as lookup failures.
         return {"success": False, "error": str(exc)}
 
+    # A zero exit code or successful process start indicates the OS accepted the launch.
     return {"success": True, "app_name": app_name, "message": f"Opened {app_name}."}

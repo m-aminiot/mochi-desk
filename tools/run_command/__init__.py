@@ -1,4 +1,4 @@
-"""Execute a user-approved terminal command in the project directory."""
+"""Public exports for running and cancelling approved terminal commands."""
 
 from .tool import DECLARATION, LIVE_DECLARATION, cancel_command, run_command
 

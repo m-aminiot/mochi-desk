@@ -1,7 +1,15 @@
-"""Gemini text chat with independent, locally saved conversations."""
+"""Text conversations, model requests, tool loops, and local chat persistence.
 
+Each conversation is stored in its own JSON file under ``chats/``. A small index
+file records the conversation order and selected chat. Gemini models use the
+Interactions API, while Gemma uses the GenerateContent API.
+"""
+
+import asyncio
+import concurrent.futures
 import json
 import platform
+import re
 import sys
 import threading
 import time
@@ -11,27 +19,144 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-from config import API_BASE_URL, get_app_data_dir, read_api_key
+from config import get_api_base_url, get_app_data_dir, read_api_key, use_custom_api_base_url
 from tools import DECLARATIONS, execute_tool
 
+# Fallback model used when a caller does not provide a valid selection.
 MODEL = "gemini-3.5-flash-lite"
+# Display names and API model IDs shared with the settings and web interface.
 TEXT_MODELS = {
     "Gemini 3.5 Flash Lite": "gemini-3.5-flash-lite",
     "Gemini 3 Flash": "gemini-3-flash-preview",
     "Gemini 2.5 Flash Lite": "gemini-2.5-flash-lite",
+    "Gemma 4 31B": "gemma-4-31b-it",
 }
-DATA_FILE = get_app_data_dir() / "chats.json"
+GEMMA_MODEL = "gemma-4-31b-it"
+# Per-chat JSON files live here; index.json stores their order and active ID.
+CHATS_DIR = get_app_data_dir() / "chats"
+CHAT_INDEX_FILE = CHATS_DIR / "index.json"
+# Previous releases stored every conversation in this single file; it is migration-only.
+LEGACY_DATA_FILE = get_app_data_dir() / "chats.json"
+# Resolve bundled resources when packaged, with the source directory as the normal fallback.
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 SOUL_FILE = RESOURCE_DIR / "soul"
+# Bound saved history and model tool loops so requests and files remain manageable.
 MAX_TURNS = 200
+MAX_TOOL_ROUNDS = 16
+MAX_TOOL_CALLS = 24
 
 
 class RequestCancelled(Exception):
-    """Raised when the user stops an in-flight text request."""
+    """Signal that the user stopped a text request before it completed."""
+
+
+class _CancellableGenAIClient:
+    """Run SDK async calls on a private event loop and allow prompt cancellation.
+
+    The app handles messages on worker threads. This wrapper lets those threads
+    wait for asynchronous SDK requests while the UI can still cancel the active
+    network future.
+    """
+
+    def __init__(self, client):
+        self.client = client
+        # Async SDK methods need a running loop; this wrapper owns one for its lifetime.
+        self.loop = asyncio.new_event_loop()
+        # Cancellation may come from another thread, so shared request state needs a lock.
+        self.lock = threading.Lock()
+        self.future = None
+        self.cancelled = False
+        self.closed = False
+        # Keep the event loop running without preventing the application from exiting.
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+
+    def _run_loop(self):
+        """Attach the private loop to its worker thread and run it until shutdown."""
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def _invoke(self, method, cancel_event=None, **kwargs):
+        """Schedule an SDK coroutine, wait for its result, and propagate cancellation."""
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelled("Request stopped by the user.")
+        with self.lock:
+            if self.cancelled or self.closed:
+                raise RequestCancelled("Request stopped by the user.")
+            # This is the thread-safe bridge from the caller into the private event loop.
+            future = asyncio.run_coroutine_threadsafe(
+                method(**kwargs), self.loop
+            )
+            self.future = future
+        try:
+            while True:
+                # Polling lets the Stop action interrupt a request that is waiting on the API.
+                if cancel_event is not None and cancel_event.is_set():
+                    self.cancel()
+                try:
+                    result = future.result(timeout=0.1)
+                    break
+                except concurrent.futures.TimeoutError:
+                    continue
+                except concurrent.futures.CancelledError as exc:
+                    raise RequestCancelled("Request stopped by the user.") from exc
+            if cancel_event is not None and cancel_event.is_set():
+                raise RequestCancelled("Request stopped by the user.")
+            return result
+        finally:
+            # Avoid clearing a different future if another request replaced this one.
+            with self.lock:
+                if self.future is future:
+                    self.future = None
+
+    def create(self, cancel_event=None, **kwargs):
+        """Call the Gemini Interactions API through the cancellable wrapper."""
+        return self._invoke(self.client.aio.interactions.create, cancel_event, **kwargs)
+
+    def generate_content(self, cancel_event=None, **kwargs):
+        """Call GenerateContent, which is the API path used for Gemma requests."""
+        return self._invoke(self.client.aio.models.generate_content, cancel_event, **kwargs)
+
+    def cancel(self):
+        """Mark the wrapper cancelled and cancel its current SDK future, if present."""
+        with self.lock:
+            self.cancelled = True
+            future = self.future
+        if future is not None:
+            future.cancel()
+
+    def close(self):
+        """Cancel outstanding work, close the SDK transports, and stop the event loop."""
+        self.cancel()
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        try:
+            # Close the asynchronous transport on the same event loop that owns it.
+            close_future = asyncio.run_coroutine_threadsafe(self.client.aio.aclose(), self.loop)
+            close_future.result(timeout=5)
+        except Exception:
+            pass
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        try:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        except RuntimeError:
+            pass
+        self.thread.join(timeout=1)
+        if not self.loop.is_closed():
+            self.loop.close()
 
 
 def read_soul() -> str:
-    """Return soul instructions plus detected host OS for both modalities."""
+    """Load assistant instructions and append the detected host environment.
+
+    Supplying OS details helps the model choose suitable commands without
+    running a separate environment-detection command for each request.
+    """
     personality = SOUL_FILE.read_text(encoding="utf-8").strip() if SOUL_FILE.exists() else ""
     system_name = platform.system() or "Unknown"
     pretty_name = {"Darwin": "macOS", "Windows": "Windows", "Linux": "Linux"}.get(
@@ -48,20 +173,64 @@ def read_soul() -> str:
 
 
 class TextChat:
+    """Manage local conversations and send text requests to supported models."""
+
     def __init__(self):
-        self.client = genai.Client(
-            api_key=read_api_key(),
-            http_options=types.HttpOptions(
-                base_url=API_BASE_URL,
-                api_version="v1beta",
-            ),
-        )
+        # Client lifecycle and conversation data have separate locks because they
+        # are accessed by different request and UI threads.
+        self._client_lock = threading.RLock()
+        self._active_request = None
+        self.client = self._create_client()
         self._lock = threading.Lock()
+        # Load existing chats, repair older or incomplete records, and persist the result.
         self.data = self._load_data()
         self._repair_data()
 
     @staticmethod
+    def _create_client():
+        """Create a Gemini SDK client using the saved key and optional custom endpoint."""
+        options = {
+            "api_version": "v1beta",
+            "timeout": 30_000,
+            "retry_options": types.HttpRetryOptions(attempts=1),
+        }
+        # When the toggle is off, the SDK's normal Google API endpoint is used.
+        if use_custom_api_base_url():
+            base_url = get_api_base_url()
+            if not base_url:
+                raise ValueError("Enter an API base URL in Settings or turn off the custom API base URL option.")
+            options["base_url"] = base_url
+        return genai.Client(api_key=read_api_key(), http_options=types.HttpOptions(**options))
+
+    def reload_client(self):
+        """Apply saved API settings by creating a replacement and closing the old client."""
+        client = self._create_client()
+        with self._client_lock:
+            previous = self.client
+            self.client = client
+        try:
+            previous.close()
+        except Exception:
+            pass
+
+    def finish_active_request(self):
+        """Release the request wrapper once the current message finishes or fails."""
+        with self._client_lock:
+            request = self._active_request
+            self._active_request = None
+        if request is not None:
+            request.close()
+
+    def cancel_active_request(self):
+        """Cancel the active asynchronous HTTP request without waiting for its timeout."""
+        with self._client_lock:
+            request = self._active_request
+        if request is not None:
+            request.cancel()
+
+    @staticmethod
     def _blank_data():
+        """Return the default in-memory database containing one empty chat."""
         chat_id = uuid.uuid4().hex
         return {
             "active_chat_id": chat_id,
@@ -69,48 +238,84 @@ class TextChat:
         }
 
     def _load_data(self):
-        if not DATA_FILE.exists():
-            # Import the old single-chat history as the first conversation.
-            old_memory = get_app_data_dir() / "memory.json"
-            if not old_memory.exists():
-                old_memory = RESOURCE_DIR / "memory.json"
-            if old_memory.exists():
-                try:
-                    old = json.loads(old_memory.read_text(encoding="utf-8"))
-                    if "turns_hex" in old:
-                        turns = [json.loads(bytes.fromhex(item).decode("utf-8")) for item in old["turns_hex"]]
-                    else:
-                        turns = []
-                        for item in old.get("steps_hex", []):
-                            step = json.loads(bytes.fromhex(item).decode("utf-8"))
-                            if step.get("type") == "user_input":
-                                turns.append([step])
-                            elif turns:
-                                turns[-1].append(step)
-                    chat_id = uuid.uuid4().hex
-                    return {
-                        "active_chat_id": chat_id,
-                        "chats": [{"id": chat_id, "title": "Imported chat", "turns": turns[-MAX_TURNS:]}],
-                    }
-                except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                    pass
-            return self._blank_data()
-        try:
-            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-            if not isinstance(data.get("chats"), list):
-                raise ValueError("expected a chats list")
-            return data
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Chat file {DATA_FILE.name} is invalid: {exc}") from exc
+        """Load split chat files, migrate older history, or create a new empty chat.
+
+        Once the index exists, it is authoritative. A corrupt index or missing
+        referenced file raises an error instead of silently discarding history.
+        """
+        CHATS_DIR.mkdir(parents=True, exist_ok=True)
+        if CHAT_INDEX_FILE.exists():
+            try:
+                index = json.loads(CHAT_INDEX_FILE.read_text(encoding="utf-8"))
+                chat_ids = index.get("chat_ids")
+                if not isinstance(chat_ids, list):
+                    raise ValueError("expected a chat_ids list")
+                chats = []
+                for chat_id in chat_ids:
+                    # Validate IDs before using them to construct file paths.
+                    if not isinstance(chat_id, str) or not re.fullmatch(r"[a-f0-9]{32}", chat_id):
+                        raise ValueError("invalid chat ID in index")
+                    chat_path = CHATS_DIR / f"{chat_id}.json"
+                    chat = json.loads(chat_path.read_text(encoding="utf-8"))
+                    if chat.get("id") != chat_id:
+                        raise ValueError(f"chat ID mismatch in {chat_path.name}")
+                    chats.append(chat)
+                return {"active_chat_id": index.get("active_chat_id"), "chats": chats}
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Chat index or chat file is invalid: {exc}") from exc
+
+        # Convert the previous all-chats JSON structure when no split index exists.
+        if LEGACY_DATA_FILE.exists():
+            try:
+                data = json.loads(LEGACY_DATA_FILE.read_text(encoding="utf-8"))
+                if not isinstance(data.get("chats"), list):
+                    raise ValueError("expected a chats list")
+                return data
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Legacy chat file {LEGACY_DATA_FILE.name} is invalid: {exc}") from exc
+
+        # The oldest format kept one conversation as hex-encoded turns in memory.json.
+        old_memory = get_app_data_dir() / "memory.json"
+        if not old_memory.exists():
+            old_memory = RESOURCE_DIR / "memory.json"
+        if old_memory.exists():
+            try:
+                old = json.loads(old_memory.read_text(encoding="utf-8"))
+                if "turns_hex" in old:
+                    turns = [json.loads(bytes.fromhex(item).decode("utf-8")) for item in old["turns_hex"]]
+                else:
+                    turns = []
+                    for item in old.get("steps_hex", []):
+                        step = json.loads(bytes.fromhex(item).decode("utf-8"))
+                        if step.get("type") == "user_input":
+                            turns.append([step])
+                        elif turns:
+                            turns[-1].append(step)
+                chat_id = uuid.uuid4().hex
+                return {
+                    "active_chat_id": chat_id,
+                    "chats": [{"id": chat_id, "title": "Imported chat", "turns": turns[-MAX_TURNS:]}],
+                }
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                pass
+        return self._blank_data()
 
     def _repair_data(self):
+        """Normalize chat records, enforce limits, and write the repaired data."""
         chats = self.data["chats"]
+        seen_ids = set()
         for chat in chats:
-            chat.setdefault("id", uuid.uuid4().hex)
+            chat_id = chat.get("id")
+            # IDs become filenames, so ensure they are safe UUID hex strings and unique.
+            if not isinstance(chat_id, str) or not re.fullmatch(r"[a-f0-9]{32}", chat_id) or chat_id in seen_ids:
+                chat_id = uuid.uuid4().hex
+                chat["id"] = chat_id
+            seen_ids.add(chat_id)
             chat.setdefault("title", "New chat")
             chat.setdefault("turns", [])
             chat["turns"] = chat["turns"][-MAX_TURNS:]
         if not chats:
+            # The interface expects one chat to remain available at all times.
             replacement = self._blank_data()
             self.data.update(replacement)
         elif self.get_chat(self.data.get("active_chat_id")) is None:
@@ -118,25 +323,238 @@ class TextChat:
         self._save_data()
 
     def _save_data(self):
-        temporary = DATA_FILE.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(DATA_FILE)
+        """Atomically write each chat file, then commit the index.
+
+        Updating the index last ensures it does not point to chat files that have
+        not yet been written. Temporary files are replaced atomically per record.
+        """
+        CHATS_DIR.mkdir(parents=True, exist_ok=True)
+        for chat in self.data["chats"]:
+            chat_file = CHATS_DIR / f"{chat['id']}.json"
+            temporary = chat_file.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(chat, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(chat_file)
+
+        index = {
+            "active_chat_id": self.data["active_chat_id"],
+            "chat_ids": [chat["id"] for chat in self.data["chats"]],
+        }
+        temporary = CHAT_INDEX_FILE.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(CHAT_INDEX_FILE)
+
+        # Remove the old combined file only after the new records and index are saved.
+        LEGACY_DATA_FILE.unlink(missing_ok=True)
+
+    @staticmethod
+    def _gemma_history(steps):
+        """Convert stored Interactions steps into GenerateContent role/part messages.
+
+        This allows Gemma to continue conversations that use the shared local
+        history format, including previous assistant tool calls and their results.
+        """
+        contents = []
+        for step in steps:
+            step_type = step.get("type")
+            if step_type == "user_input":
+                parts = [
+                    types.Part(text=item["text"])
+                    for item in step.get("content", [])
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                ]
+                if parts:
+                    contents.append(types.Content(role="user", parts=parts))
+            elif step_type == "model_output":
+                parts = [
+                    types.Part(text=item["text"])
+                    for item in step.get("content", [])
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                ]
+                if parts:
+                    contents.append(types.Content(role="model", parts=parts))
+            elif step_type == "function_call":
+                contents.append(types.Content(
+                    role="model",
+                    parts=[types.Part.from_function_call(
+                        name=step.get("name", ""), args=step.get("arguments", {})
+                    )],
+                ))
+            elif step_type == "function_result":
+                # Tool output is stored as JSON text; decode it for the SDK response part.
+                result_text = "".join(
+                    item.get("text", "") for item in step.get("result", [])
+                    if isinstance(item, dict)
+                )
+                try:
+                    result_value = json.loads(result_text)
+                except (ValueError, TypeError):
+                    result_value = {"result": result_text}
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_function_response(
+                        name=step.get("name", "tool"), response=result_value
+                    )],
+                ))
+        return contents
+
+    def _send_gemma_message(
+        self, message, chat_id, on_tool_event, confirm_tool, cancel_event,
+        previous_steps, user_step, soul,
+    ):
+        """Run a Gemma turn, execute requested tools, and persist the completed exchange.
+
+        Gemma uses GenerateContent rather than the Interactions API. Each tool
+        result is fed back in a bounded loop so the model can choose the next
+        action or produce its final response.
+        """
+        request = _CancellableGenAIClient(self._create_client())
+        with self._client_lock:
+            self._active_request = request
+        contents = self._gemma_history([*previous_steps, user_step])
+        turn_steps = []
+        response_text = ""
+        tool_call_count = 0
+        declarations = [
+            # GenerateContent function declarations omit the Interactions-only type field.
+            {key: value for key, value in item.items() if key != "type"}
+            for item in DECLARATIONS
+        ]
+
+        def ensure_active():
+            if cancel_event is not None and cancel_event.is_set():
+                raise RequestCancelled("Request stopped by the user.")
+
+        try:
+            for tool_round in range(MAX_TOOL_ROUNDS + 1):
+                ensure_active()
+                # Tools are disabled on the final round so the model must finish with an answer.
+                config = types.GenerateContentConfig(
+                    system_instruction=soul or None,
+                    tools=[types.Tool(function_declarations=declarations)]
+                    if tool_round < MAX_TOOL_ROUNDS else None,
+                )
+                for attempt in range(4):
+                    try:
+                        # Retry only transient service failures; invalid requests should fail fast.
+                        interaction = request.generate_content(
+                            cancel_event=cancel_event,
+                            model=GEMMA_MODEL,
+                            contents=contents,
+                            config=config,
+                        )
+                        break
+                    except Exception as exc:
+                        ensure_active()
+                        code = getattr(exc, "code", None)
+                        if code not in (429, 500, 502, 503, 504) or attempt == 3:
+                            raise
+                        if cancel_event is not None:
+                            if cancel_event.wait(1.5 * (2 ** attempt)):
+                                ensure_active()
+                        else:
+                            time.sleep(1.5 * (2 ** attempt))
+
+                ensure_active()
+                candidate = next(iter(interaction.candidates or []), None)
+                if candidate is None or candidate.content is None:
+                    raise ValueError("Gemma returned no candidate content.")
+                model_content = candidate.content
+                # Keep the model response in context before appending any tool results.
+                contents.append(model_content)
+                function_calls = []
+                for part in model_content.parts or []:
+                    if part.text:
+                        response_text += part.text
+                        turn_steps.append({
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": part.text}],
+                        })
+                    if part.function_call:
+                        function_calls.append(part.function_call)
+                        turn_steps.append({
+                            "type": "function_call",
+                            "id": getattr(part.function_call, "id", None) or uuid.uuid4().hex,
+                            "name": part.function_call.name,
+                            "arguments": part.function_call.args or {},
+                        })
+                if not function_calls:
+                    break
+
+                # Run model-requested tools in order, then return all results for the next round.
+                function_responses = []
+                for call in function_calls:
+                    ensure_active()
+                    tool_call_count += 1
+                    if tool_call_count > MAX_TOOL_CALLS:
+                        result = {
+                            "success": False,
+                            "error": "This task reached the per-message tool-call limit. Summarize verified progress and clearly state what remains.",
+                        }
+                    else:
+                        result = execute_tool(
+                            call.name, call.args or {}, on_event=on_tool_event, confirm=confirm_tool
+                        )
+                    ensure_active()
+                    result_text = json.dumps(result, ensure_ascii=False)
+                    turn_steps.append({
+                        "type": "function_result",
+                        "call_id": getattr(call, "id", None) or "",
+                        "name": call.name,
+                        "result": [{"type": "text", "text": result_text}],
+                    })
+                    function_responses.append(types.Part.from_function_response(
+                        name=call.name, response=result
+                    ))
+                contents.append(types.Content(role="user", parts=function_responses))
+
+            ensure_active()
+            if not response_text:
+                response_text = "Gemma completed the requested tool action, but returned no text."
+            new_turn = [user_step, *turn_steps]
+            with self._lock:
+                ensure_active()
+                current_chat = self.get_chat(chat_id)
+                if current_chat is None:
+                    raise KeyError("Chat does not exist")
+                previous_turns = list(current_chat["turns"])
+                previous_title = current_chat["title"]
+                current_chat["turns"] = [*previous_turns, new_turn][-MAX_TURNS:]
+                if current_chat["title"] == "New chat":
+                    current_chat["title"] = " ".join(message.split())[:36] or "New chat"
+                try:
+                    self._save_data()
+                except Exception:
+                    # Restore memory if writing to disk failed, avoiding a false saved state.
+                    current_chat["turns"] = previous_turns
+                    current_chat["title"] = previous_title
+                    raise
+            return response_text
+        finally:
+            request.close()
+            with self._client_lock:
+                if self._active_request is request:
+                    self._active_request = None
 
     def list_chats(self):
+        """Return chats in the order used by the conversation list."""
         return self.data["chats"]
 
     def get_chat(self, chat_id=None):
+        """Find a chat by ID, defaulting to the currently selected conversation."""
         chat_id = chat_id or self.data.get("active_chat_id")
         return next((chat for chat in self.data["chats"] if chat["id"] == chat_id), None)
 
     def get_active_chat_id(self):
+        """Return the ID currently selected in the interface."""
         return self.data["active_chat_id"]
 
     def get_turns(self, chat_id=None):
+        """Return the selected chat's saved turns, or an empty list if it is missing."""
         chat = self.get_chat(chat_id)
         return chat["turns"] if chat else []
 
     def create_chat(self):
+        """Create, save, and select a new empty conversation."""
         with self._lock:
             chat = {"id": uuid.uuid4().hex, "title": "New chat", "turns": []}
             self.data["chats"].insert(0, chat)
@@ -145,26 +563,38 @@ class TextChat:
             return chat
 
     def select_chat(self, chat_id):
+        """Select an existing chat and persist the active ID in the index."""
         if self.get_chat(chat_id) is None:
             raise KeyError("Chat does not exist")
         self.data["active_chat_id"] = chat_id
         self._save_data()
 
     def delete_chat(self, chat_id):
+        """Delete a chat file and select another chat if the active one was removed."""
         with self._lock:
-            self.data["chats"] = [chat for chat in self.data["chats"] if chat["id"] != chat_id]
+            existing = next((chat for chat in self.data["chats"] if chat["id"] == chat_id), None)
+            if existing is None:
+                raise KeyError("Chat does not exist")
+            self.data["chats"] = [chat for chat in self.data["chats"] if chat["id"] != existing["id"]]
             if not self.data["chats"]:
                 replacement = self._blank_data()
                 self.data.update(replacement)
             elif self.data.get("active_chat_id") == chat_id:
                 self.data["active_chat_id"] = self.data["chats"][0]["id"]
             self._save_data()
+            (CHATS_DIR / f"{existing['id']}.json").unlink(missing_ok=True)
             return self.data["active_chat_id"]
 
     def send_message(
         self, message: str, chat_id=None, on_tool_event=None, confirm_tool=None, model=None,
         cancel_event=None,
     ) -> str:
+        """Send a user message, run model/tool steps, and save the completed turn.
+
+        Gemini and Gemma use different API request formats but share local history
+        and tool handlers. Network and tool work stays outside the history lock
+        so stopping a request or navigating chats remains responsive.
+        """
         with self._lock:
             chat = self.get_chat(chat_id)
             if chat is None:
@@ -178,32 +608,43 @@ class TextChat:
             "content": [{"type": "text", "text": message}],
         }
         soul = read_soul()
+        # Gemma needs GenerateContent; the Gemini models continue through Interactions below.
+        if model == GEMMA_MODEL:
+            return self._send_gemma_message(
+                message, chat_id, on_tool_event, confirm_tool, cancel_event,
+                previous_steps, user_step, soul,
+            )
         full_input = [*previous_steps, user_step]
         turn_steps = []
         request_input = full_input
         response = ""
         tool_call_count = 0
+        request = _CancellableGenAIClient(self._create_client())
+        with self._client_lock:
+            self._active_request = request
 
         def ensure_active():
             if cancel_event is not None and cancel_event.is_set():
                 raise RequestCancelled("Request stopped by the user.")
 
-        # Keep network requests and tool execution outside the history lock so
-        # stopping a slow request never blocks new chats or later messages.
-        for tool_round in range(9):
+        # Keep network and tool work outside the history lock so Stop and chat navigation stay responsive.
+        for tool_round in range(MAX_TOOL_ROUNDS + 1):
             for attempt in range(4):
                 ensure_active()
                 try:
-                    interaction = self.client.interactions.create(
+                    ensure_active()
+                    interaction = request.create(
+                        cancel_event=cancel_event,
                         model=model if model in TEXT_MODELS.values() else MODEL,
                         input=request_input,
                         store=False,
                         system_instruction=soul or None,
-                        tools=DECLARATIONS if tool_round < 8 else [],
+                        tools=DECLARATIONS if tool_round < MAX_TOOL_ROUNDS else [],
                     )
                     break
                 except Exception as exc:
                     ensure_active()
+                    # Back off only for quota or temporary server errors; surface other failures.
                     code = getattr(exc, "code", None)
                     if code not in (429, 500, 502, 503, 504) or attempt == 3:
                         raise
@@ -215,6 +656,7 @@ class TextChat:
 
             ensure_active()
             response_steps = list(interaction.steps or [])
+            # Preserve the provider's native steps so later Gemini calls can reuse this history.
             turn_steps.extend(step.model_dump() for step in response_steps)
             function_calls = [step for step in response_steps if step.type == "function_call"]
             response = interaction.output_text or ""
@@ -222,11 +664,15 @@ class TextChat:
                 break
 
             function_results = []
+            # Sequential execution preserves action order and lets each command request approval.
             for call in function_calls:
                 ensure_active()
                 tool_call_count += 1
-                if tool_call_count > 8:
-                    result = {"success": False, "error": "Tool-call limit reached for this message."}
+                if tool_call_count > MAX_TOOL_CALLS:
+                    result = {
+                        "success": False,
+                        "error": "This task reached the per-message tool-call limit. Summarize verified progress and clearly state what remains.",
+                    }
                 else:
                     result = execute_tool(
                         call.name, call.arguments, on_event=on_tool_event, confirm=confirm_tool
@@ -258,6 +704,7 @@ class TextChat:
             try:
                 self._save_data()
             except Exception:
+                # Roll back memory so the UI does not show a turn that was not saved.
                 current_chat["turns"] = previous_turns
                 current_chat["title"] = previous_title
                 raise

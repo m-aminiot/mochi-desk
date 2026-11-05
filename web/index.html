@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d0d0d">
+  <title>Mochi Desk</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand"><span class="brand-mark">✳</span><span>Mochi</span><button class="icon-button sidebar-close" id="sidebar-close" aria-label="Close">×</button></div>
+      <button class="new-chat" id="new-chat"><span>＋</span> New chat</button>
+      <div class="chat-list-heading">Recent chats</div>
+      <nav id="chat-list" class="chat-list"></nav>
+      <div class="sidebar-bottom"><button class="settings-open" id="settings-open">⚙　Settings</button><a class="project-link" href="https://github.com/m-aminiot" target="_blank" rel="noopener noreferrer">GitHub: https://github.com/m-aminiot</a><span class="local-note">Your chats stay on this device</span></div>
+    </aside>
+    <main class="main-panel">
+      <header class="topbar">
+        <button class="icon-button menu-button" id="menu-button" aria-label="Chats">☰</button>
+        <div class="conversation-name"><span class="online-dot"></span><span id="chat-title">Mochi</span></div>
+        <div class="top-actions"><button class="icon-button" id="settings-shortcut" title="Settings">⚙</button><button class="icon-button" id="new-chat-shortcut" title="New chat">＋</button></div>
+      </header>
+
+      <section class="setup-warning hidden" id="setup-warning" role="alert">
+        <div class="warning-mark">!</div>
+        <div class="warning-copy"><strong>Setup required</strong><span id="setup-warning-text">Add your Gemini API key in Settings to start chatting.</span></div>
+        <button class="button primary" id="setup-open-settings">Open Settings</button>
+      </section>
+
+      <section class="conversation" id="conversation" aria-live="polite">
+        <div class="welcome" id="welcome"><div class="welcome-mark">✳</div><h1>Hi, I’m Mochi.</h1><p>What’s on your mind?</p></div>
+        <div class="messages" id="messages"></div>
+      </section>
+
+      <section class="voice-panel hidden" id="voice-panel">
+        <div class="voice-orb" id="voice-orb"><span>✳</span></div>
+        <div class="voice-status" id="voice-status">Start a voice chat whenever you’re ready.</div>
+        <div class="voice-reply" id="voice-reply"></div>
+        <div class="voice-controls"><button class="button subtle" id="mute-voice">Mute microphone</button><button class="button danger" id="stop-voice">End voice chat</button></div>
+        <div id="voice-tools" class="voice-tools"></div>
+      </section>
+
+      <footer class="composer-area" id="composer-area">
+        <div class="composer" id="composer">
+          <button class="composer-plus voice-launch" id="voice-toggle" title="Start voice chat" aria-label="Start voice chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3.5 3.5 0 0 0 3.5-3.5v-4a3.5 3.5 0 0 0-7 0v4A3.5 3.5 0 0 0 12 14Z"/><path d="M5.5 10.5a6.5 6.5 0 0 0 13 0M12 17v4m-4 0h8"/></svg></button>
+          <textarea id="message-input" dir="auto" rows="1" placeholder="Message Mochi" aria-label="Your message"></textarea>
+          <div class="composer-tools"><select id="model-select" aria-label="Model"></select><button class="send-button" id="send-button" title="Send">↑</button></div>
+        </div>
+        <div class="composer-status" id="status">Mochi may make mistakes, so double-check important details.</div>
+      </footer>
+    </main>
+  </div>
+
+  <div class="overlay hidden" id="approval-overlay" role="dialog" aria-modal="true" aria-labelledby="approval-title">
+    <div class="dialog approval-dialog"><div class="dialog-symbol warning">!</div><h2 id="approval-title">Approve command</h2><p>Mochi wants to run this command on your computer. Review it before continuing.</p><pre id="approval-command" dir="ltr"></pre><div class="working-directory" id="approval-directory" dir="ltr"></div><div class="dialog-actions"><button class="button subtle" id="reject-command">Reject</button><button class="button danger" id="approve-command">Approve and run</button></div></div>
+  </div>
+
+  <div class="overlay hidden" id="settings-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="dialog settings-dialog"><button class="dialog-close" id="settings-close" aria-label="Close">×</button><h2 id="settings-title">Settings</h2><label>Color theme<select id="theme-select"></select></label><label>Text model<select id="settings-model-select"></select></label><label>Gemini API key<input id="api-key-input" type="password" autocomplete="new-password" placeholder="Enter a new key to replace the saved one"></label><label class="setting-toggle"><input id="use-custom-api-base-url" type="checkbox"><span>Use a custom API base URL</span></label><label>API base URL<input id="api-base-url-input" type="url" inputmode="url" placeholder="https://example.com"></label><p class="settings-note">Turn this off to connect directly to Google's Gemini API. Your settings and key are saved locally on this device.</p><a class="project-link settings-project-link" href="https://github.com/m-aminiot" target="_blank" rel="noopener noreferrer">GitHub: https://github.com/m-aminiot</a><div class="dialog-actions"><button class="button subtle" id="cancel-settings">Close</button><button class="button primary" id="save-settings">Save</button></div></div>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
