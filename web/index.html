@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" dir="ltr">
+<html lang="en" dir="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -20,7 +20,7 @@
       <header class="topbar">
         <button class="icon-button menu-button" id="menu-button" aria-label="Chats">☰</button>
         <div class="conversation-name"><span class="online-dot"></span><span id="chat-title">Mochi</span></div>
-        <div class="top-actions"><button class="icon-button" id="settings-shortcut" title="Settings">⚙</button><button class="icon-button" id="new-chat-shortcut" title="New chat">＋</button></div>
+        <div class="top-actions"><button class="icon-button" id="theme-toggle" title="Switch to light theme" aria-label="Switch to light theme">☀️</button><button class="icon-button" id="settings-shortcut" title="Settings">⚙</button><button class="icon-button" id="new-chat-shortcut" title="New chat">＋</button></div>
       </header>
 
       <section class="setup-warning hidden" id="setup-warning" role="alert">
@@ -35,7 +35,7 @@
       </section>
 
       <section class="voice-panel hidden" id="voice-panel">
-        <div class="voice-orb" id="voice-orb"><span>✳</span></div>
+        <div class="voice-visualizer" id="voice-visualizer" role="img" aria-label="Live voice activity"><div class="voice-orb" id="voice-orb"><canvas id="voice-waveform" aria-hidden="true"></canvas><span class="voice-orb-mark">✳</span></div><div class="voice-meter-labels"><span>Mic <i id="mic-level"></i></span><span>Assistant <i id="assistant-level"></i></span></div></div>
         <div class="voice-status" id="voice-status">Start a voice chat whenever you’re ready.</div>
         <div class="voice-reply" id="voice-reply"></div>
         <div class="voice-controls"><button class="button subtle" id="mute-voice">Mute microphone</button><button class="button danger" id="stop-voice">End voice chat</button></div>
@@ -45,10 +45,13 @@
       <footer class="composer-area" id="composer-area">
         <div class="composer" id="composer">
           <button class="composer-plus voice-launch" id="voice-toggle" title="Start voice chat" aria-label="Start voice chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3.5 3.5 0 0 0 3.5-3.5v-4a3.5 3.5 0 0 0-7 0v4A3.5 3.5 0 0 0 12 14Z"/><path d="M5.5 10.5a6.5 6.5 0 0 0 13 0M12 17v4m-4 0h8"/></svg></button>
+          <button class="composer-plus attach-button" id="attach-button" title="Attach files" aria-label="Attach files">📎</button>
+          <input id="file-input" type="file" hidden multiple accept="image/png,image/jpeg,image/webp,image/gif,image/heic,image/heif,image/bmp,image/tiff,application/pdf,.docx,.xlsx,.pptx,.odt,.ods,.odp,.txt,.md,.csv,.json,.py,.js,.ts,.jsx,.tsx,.html,.css,.xml,.yaml,.yml,.toml,.sql,.sh,.c,.h,.cpp,.java,.go,.rs,.php,.rb,.log">
+          <div class="attachment-preview hidden" id="attachment-preview"></div>
           <textarea id="message-input" dir="auto" rows="1" placeholder="Message Mochi" aria-label="Your message"></textarea>
           <div class="composer-tools"><select id="model-select" aria-label="Model"></select><button class="send-button" id="send-button" title="Send">↑</button></div>
         </div>
-        <div class="composer-status" id="status">Mochi may make mistakes, so double-check important details.</div>
+        <div class="composer-status" id="status" aria-live="polite">Mochi may make mistakes, so double-check important details.</div>
       </footer>
     </main>
   </div>

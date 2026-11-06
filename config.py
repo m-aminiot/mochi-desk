@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import tempfile
 
 
 def get_app_data_dir() -> Path:
@@ -19,6 +20,12 @@ def get_app_data_dir() -> Path:
 TOKEN_FILE = get_app_data_dir() / "ApiToken.txt"
 # Store non-secret preferences such as the selected model and optional API endpoint here.
 SETTINGS_FILE = get_app_data_dir() / "settings.json"
+DEFAULT_SETTINGS = {
+    "theme": "Violet",
+    "model": "gemini-3.5-flash-lite",
+    "api_base_url": "",
+    "use_custom_api_base_url": False,
+}
 
 
 def _read_settings() -> dict:
@@ -31,6 +38,18 @@ def _read_settings() -> dict:
     # A first launch may not have a settings file yet; malformed files use defaults too.
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def save_settings(settings: dict) -> dict:
+    """Persist the canonical settings mapping atomically and return its normalized form."""
+    clean = {**DEFAULT_SETTINGS, **{key: value for key, value in settings.items() if key in DEFAULT_SETTINGS}}
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=SETTINGS_FILE.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        json.dump(clean, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+    temporary.replace(SETTINGS_FILE)
+    return clean
 
 
 def get_api_base_url() -> str:

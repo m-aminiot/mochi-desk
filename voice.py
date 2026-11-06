@@ -80,6 +80,20 @@ class VoiceSession:
         self._stop_requested = threading.Event()
         self._microphone_muted = threading.Event()
         self._microphone_frames = None
+        self.on_level = lambda channel, value: None
+        self._levels = {"input": 0.0, "output": 0.0}
+        self._levels_lock = threading.Lock()
+
+    def levels(self):
+        """Return a thread-safe snapshot of the current input/output audio levels."""
+        with self._levels_lock:
+            return dict(self._levels)
+
+    def _report_level(self, channel, value):
+        """Store a normalized level and notify the optional UI callback."""
+        with self._levels_lock:
+            self._levels[channel] = value
+        self.on_level(channel, value)
 
     def set_microphone_muted(self, muted: bool):
         """Stop sending captured speech while keeping the Live session connected.
@@ -206,6 +220,8 @@ class VoiceSession:
                     if len(frame) < byte_count:
                         # PortAudio expects a complete frame; pad underruns with silence.
                         frame += b"\0" * (byte_count - len(frame))
+                    output_samples = np.frombuffer(frame, dtype=np.int16)
+                    self._report_level("output", min(1.0, float(np.sqrt(np.mean(output_samples.astype(np.float32) ** 2))) / 12000) if output_samples.size else 0.0)
                     try:
                         reference_frames.put_nowait(frame)
                     except queue.Full:
@@ -219,6 +235,9 @@ class VoiceSession:
                 def input_callback(in_data, _frame_count, _time_info, _status):
                     """Clean microphone audio and enqueue the newest frame for upload."""
                     try:
+                        input_samples = np.frombuffer(in_data or b"", dtype=np.int16)
+                        input_level = min(1.0, float(np.sqrt(np.mean(input_samples.astype(np.float32) ** 2))) / 12000) if input_samples.size else 0.0
+                        self._report_level("input", 0.0 if self._microphone_muted.is_set() else input_level)
                         if self._microphone_muted.is_set():
                             return None, pyaudio.paContinue
                         try:

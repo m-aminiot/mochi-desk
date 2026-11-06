@@ -9,9 +9,11 @@ Mochi Desk is a Python desktop assistant with a local web interface. It provides
 ## Features
 
 - **Text chat:** Create and switch between conversations. Text history is stored locally in `chats.json`, with up to 200 turns per conversation.
+- **Streaming and attachments:** Text replies stream into the chat as they arrive. Attach up to four images, PDFs, or supported text/code files (8 MB each); files are kept in the local `uploads/` folder and sent to Gemini with the message.
 - **Voice chat:** Talk to Gemini Live using your microphone and speakers. Voice context lasts for the active session; voice transcripts are not saved as regular chat history.
 - **Local tools:** Ask Mochi to open an installed app or run a terminal command. Mochi shows each terminal command and waits for your approval before running it.
 - **Settings:** Choose a text model and color theme, configure your Gemini API key, and optionally set a custom API base URL.
+- **Live updates:** The browser receives chat and tool events over a local WebSocket connection, with HTTP polling used while reconnecting.
 
 ## Requirements
 
@@ -21,7 +23,7 @@ Mochi Desk is a Python desktop assistant with a local web interface. It provides
 
 ## First-time setup
 
-Open a terminal, change to the project directory, create a virtual environment, activate it, and install the dependencies. The dependency file in this project is named `requerments.txt` (with that spelling).
+Open a terminal, change to the project directory, create a virtual environment, activate it, and install the dependencies from `requirements.txt`.
 
 ### macOS and Linux
 
@@ -30,7 +32,7 @@ cd /path/to/Gemini
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requerments.txt
+python -m pip install -r requirements.txt
 ```
 
 ### Windows PowerShell
@@ -40,7 +42,7 @@ cd C:\path\to\Gemini
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requerments.txt
+python -m pip install -r requirements.txt
 ```
 
 Replace the example path with the actual location of this project. If PowerShell blocks environment activation, follow Microsoft's instructions for your machine's execution policy or activate the environment from Command Prompt with `.venv\Scripts\activate.bat`.
@@ -58,6 +60,7 @@ api_key=YOUR_GEMINI_API_KEY
 ```
 
 Settings, the API key file, chat history, and preferences are stored locally. Keep your API key private and do not commit it or include it in screenshots.
+Diagnostic errors are written to the rotating `logs/mochi.log` file; chat message contents and API keys are not intentionally logged.
 
 ### Optional Cloudflare Worker proxy
 
@@ -128,7 +131,7 @@ The `soul` file contains Mochi's personality and behavior instructions. Editing 
 ## Troubleshooting
 
 - **Setup notice appears:** Open Settings and provide your API key. If custom API routing is enabled, also enter its base URL.
-- **`ModuleNotFoundError`:** Make sure you are in the project directory and have activated `.venv` in the current terminal, then install the dependencies with `python -m pip install -r requerments.txt`.
+- **`ModuleNotFoundError`:** Make sure you are in the project directory and have activated `.venv` in the current terminal, then install the dependencies with `python -m pip install -r requirements.txt`.
 - **PyAudio installation fails:** Install the audio and compiler packages required by your operating system, then retry the pip installation.
 - **A model or API request fails:** Check the API key, the custom API base URL if enabled, selected model access, and the service's quota or availability.
 

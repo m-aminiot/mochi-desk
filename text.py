@@ -6,12 +6,14 @@ Interactions API, while Gemma uses the GenerateContent API.
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import json
 import platform
 import re
 import sys
 import threading
+from datetime import datetime, timezone
 import time
 import uuid
 from pathlib import Path
@@ -35,6 +37,7 @@ GEMMA_MODEL = "gemma-4-31b-it"
 # Per-chat JSON files live here; index.json stores their order and active ID.
 CHATS_DIR = get_app_data_dir() / "chats"
 CHAT_INDEX_FILE = CHATS_DIR / "index.json"
+UPLOAD_DIR = get_app_data_dir() / "uploads"
 # Previous releases stored every conversation in this single file; it is migration-only.
 LEGACY_DATA_FILE = get_app_data_dir() / "chats.json"
 # Resolve bundled resources when packaged, with the source directory as the normal fallback.
@@ -44,6 +47,12 @@ SOUL_FILE = RESOURCE_DIR / "soul"
 MAX_TURNS = 200
 MAX_TOOL_ROUNDS = 16
 MAX_TOOL_CALLS = 24
+MAX_TEXT_ATTACHMENT_CHARS = 1_000_000
+TEXT_UPLOAD_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".json", ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".html", ".css", ".xml", ".yaml", ".yml", ".toml", ".sql", ".sh",
+    ".c", ".h", ".cpp", ".java", ".go", ".rs", ".php", ".rb", ".log",
+}
 
 
 class RequestCancelled(Exception):
@@ -116,6 +125,44 @@ class _CancellableGenAIClient:
     def generate_content(self, cancel_event=None, **kwargs):
         """Call GenerateContent, which is the API path used for Gemma requests."""
         return self._invoke(self.client.aio.models.generate_content, cancel_event, **kwargs)
+
+    def stream(self, method, on_delta, cancel_event=None, **kwargs):
+        """Consume an SDK async stream on its owning loop and forward text deltas."""
+        async def consume():
+            stream = await method(**kwargs)
+            items = []
+            async for item in stream:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RequestCancelled("Request stopped by the user.")
+                event_type = getattr(item, "event_type", None)
+                delta = getattr(item, "delta", None)
+                if event_type == "step.delta" and getattr(delta, "type", None) == "text":
+                    if delta.text:
+                        on_delta(delta.text)
+                elif getattr(item, "text", None):
+                    on_delta(item.text)
+                items.append(item)
+            return items
+
+        with self.lock:
+            if self.cancelled or self.closed:
+                raise RequestCancelled("Request stopped by the user.")
+            future = asyncio.run_coroutine_threadsafe(consume(), self.loop)
+            self.future = future
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    self.cancel()
+                try:
+                    return future.result(timeout=0.1)
+                except concurrent.futures.TimeoutError:
+                    continue
+                except concurrent.futures.CancelledError as exc:
+                    raise RequestCancelled("Request stopped by the user.") from exc
+        finally:
+            with self.lock:
+                if self.future is future:
+                    self.future = None
 
     def cancel(self):
         """Mark the wrapper cancelled and cancel its current SDK future, if present."""
@@ -234,7 +281,7 @@ class TextChat:
         chat_id = uuid.uuid4().hex
         return {
             "active_chat_id": chat_id,
-            "chats": [{"id": chat_id, "title": "New chat", "turns": []}],
+            "chats": [{"id": chat_id, "title": "New chat", "turns": [], "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}],
         }
 
     def _load_data(self):
@@ -313,6 +360,9 @@ class TextChat:
             seen_ids.add(chat_id)
             chat.setdefault("title", "New chat")
             chat.setdefault("turns", [])
+            fallback_time = datetime.fromtimestamp((CHATS_DIR / f"{chat_id}.json").stat().st_mtime, timezone.utc).isoformat() if (CHATS_DIR / f"{chat_id}.json").exists() else datetime.now(timezone.utc).isoformat()
+            chat.setdefault("created_at", fallback_time)
+            chat.setdefault("updated_at", chat["created_at"])
             chat["turns"] = chat["turns"][-MAX_TURNS:]
         if not chats:
             # The interface expects one chat to remain available at all times.
@@ -362,6 +412,16 @@ class TextChat:
                     for item in step.get("content", [])
                     if isinstance(item, dict) and isinstance(item.get("text"), str)
                 ]
+                for item in step.get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "attachment":
+                        if not re.fullmatch(r"[a-f0-9]{32}\.[a-z0-9]{1,8}", str(item.get("id", ""))):
+                            raise ValueError("Saved attachment reference is invalid.")
+                        path = UPLOAD_DIR / item["id"]
+                        attachment_text = TextChat._read_text_attachment(item, path)
+                        if attachment_text is not None:
+                            parts.append(types.Part(text=attachment_text))
+                        else:
+                            parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=item["mime_type"]))
                 if parts:
                     contents.append(types.Content(role="user", parts=parts))
             elif step_type == "model_output":
@@ -399,7 +459,7 @@ class TextChat:
 
     def _send_gemma_message(
         self, message, chat_id, on_tool_event, confirm_tool, cancel_event,
-        previous_steps, user_step, soul,
+        previous_steps, user_step, soul, on_delta,
     ):
         """Run a Gemma turn, execute requested tools, and persist the completed exchange.
 
@@ -433,18 +493,29 @@ class TextChat:
                     tools=[types.Tool(function_declarations=declarations)]
                     if tool_round < MAX_TOOL_ROUNDS else None,
                 )
+                round_streamed = False
+
+                def forward_delta(delta):
+                    nonlocal round_streamed
+                    round_streamed = True
+                    if on_delta:
+                        on_delta(delta)
+
                 for attempt in range(4):
                     try:
-                        # Retry only transient service failures; invalid requests should fail fast.
-                        interaction = request.generate_content(
-                            cancel_event=cancel_event,
-                            model=GEMMA_MODEL,
-                            contents=contents,
-                            config=config,
-                        )
+                        chunks = request.stream(
+                            request.client.aio.models.generate_content_stream,
+                            forward_delta, cancel_event=cancel_event, model=GEMMA_MODEL,
+                            contents=contents, config=config,
+                        ) if on_delta else [request.generate_content(
+                            cancel_event=cancel_event, model=GEMMA_MODEL,
+                            contents=contents, config=config,
+                        )]
                         break
                     except Exception as exc:
                         ensure_active()
+                        if round_streamed:
+                            raise
                         code = getattr(exc, "code", None)
                         if code not in (429, 500, 502, 503, 504) or attempt == 3:
                             raise
@@ -455,10 +526,12 @@ class TextChat:
                             time.sleep(1.5 * (2 ** attempt))
 
                 ensure_active()
-                candidate = next(iter(interaction.candidates or []), None)
+                candidates = [candidate for chunk in chunks for candidate in (chunk.candidates or [])]
+                candidate = candidates[-1] if candidates else None
                 if candidate is None or candidate.content is None:
                     raise ValueError("Gemma returned no candidate content.")
-                model_content = candidate.content
+                model_parts = [part for item in candidates if item.content for part in (item.content.parts or [])]
+                model_content = types.Content(role="model", parts=model_parts)
                 # Keep the model response in context before appending any tool results.
                 contents.append(model_content)
                 function_calls = []
@@ -518,7 +591,9 @@ class TextChat:
                     raise KeyError("Chat does not exist")
                 previous_turns = list(current_chat["turns"])
                 previous_title = current_chat["title"]
+                previous_updated_at = current_chat.get("updated_at")
                 current_chat["turns"] = [*previous_turns, new_turn][-MAX_TURNS:]
+                current_chat["updated_at"] = datetime.now(timezone.utc).isoformat()
                 if current_chat["title"] == "New chat":
                     current_chat["title"] = " ".join(message.split())[:36] or "New chat"
                 try:
@@ -527,6 +602,8 @@ class TextChat:
                     # Restore memory if writing to disk failed, avoiding a false saved state.
                     current_chat["turns"] = previous_turns
                     current_chat["title"] = previous_title
+                    if previous_updated_at is not None:
+                        current_chat["updated_at"] = previous_updated_at
                     raise
             return response_text
         finally:
@@ -556,7 +633,8 @@ class TextChat:
     def create_chat(self):
         """Create, save, and select a new empty conversation."""
         with self._lock:
-            chat = {"id": uuid.uuid4().hex, "title": "New chat", "turns": []}
+            now = datetime.now(timezone.utc).isoformat()
+            chat = {"id": uuid.uuid4().hex, "title": "New chat", "turns": [], "created_at": now, "updated_at": now}
             self.data["chats"].insert(0, chat)
             self.data["active_chat_id"] = chat["id"]
             self._save_data()
@@ -587,7 +665,7 @@ class TextChat:
 
     def send_message(
         self, message: str, chat_id=None, on_tool_event=None, confirm_tool=None, model=None,
-        cancel_event=None,
+        cancel_event=None, attachments=None, on_delta=None,
     ) -> str:
         """Send a user message, run model/tool steps, and save the completed turn.
 
@@ -607,12 +685,13 @@ class TextChat:
             "type": "user_input",
             "content": [{"type": "text", "text": message}],
         }
+        user_step["content"].extend({"type": "attachment", **item} for item in attachments or [])
         soul = read_soul()
         # Gemma needs GenerateContent; the Gemini models continue through Interactions below.
         if model == GEMMA_MODEL:
             return self._send_gemma_message(
                 message, chat_id, on_tool_event, confirm_tool, cancel_event,
-                previous_steps, user_step, soul,
+                previous_steps, user_step, soul, on_delta,
             )
         full_input = [*previous_steps, user_step]
         turn_steps = []
@@ -629,21 +708,49 @@ class TextChat:
 
         # Keep network and tool work outside the history lock so Stop and chat navigation stay responsive.
         for tool_round in range(MAX_TOOL_ROUNDS + 1):
+            round_streamed = False
+            round_text = []
+
+            def forward_delta(delta):
+                nonlocal round_streamed
+                round_streamed = True
+                round_text.append(delta)
+                if on_delta:
+                    on_delta(delta)
+
             for attempt in range(4):
                 ensure_active()
                 try:
                     ensure_active()
-                    interaction = request.create(
-                        cancel_event=cancel_event,
-                        model=model if model in TEXT_MODELS.values() else MODEL,
-                        input=request_input,
-                        store=False,
-                        system_instruction=soul or None,
-                        tools=DECLARATIONS if tool_round < MAX_TOOL_ROUNDS else [],
-                    )
+                    api_input = self._interaction_input(request_input)
+                    if on_delta:
+                        events = request.stream(
+                            request.client.aio.interactions.create,
+                            forward_delta, cancel_event=cancel_event,
+                            model=model if model in TEXT_MODELS.values() else MODEL,
+                            input=api_input, store=False, stream=True,
+                            system_instruction=soul or None,
+                            tools=DECLARATIONS if tool_round < MAX_TOOL_ROUNDS else [],
+                        )
+                        completed = next((event.interaction for event in reversed(events)
+                                          if getattr(event, "event_type", None) == "interaction.completed"), None)
+                        if completed is None:
+                            raise ValueError("The streamed interaction ended without a completed response.")
+                        interaction = completed
+                    else:
+                        interaction = request.create(
+                            cancel_event=cancel_event,
+                            model=model if model in TEXT_MODELS.values() else MODEL,
+                            input=api_input,
+                            store=False,
+                            system_instruction=soul or None,
+                            tools=DECLARATIONS if tool_round < MAX_TOOL_ROUNDS else [],
+                        )
                     break
                 except Exception as exc:
                     ensure_active()
+                    if round_streamed:
+                        raise
                     # Back off only for quota or temporary server errors; surface other failures.
                     code = getattr(exc, "code", None)
                     if code not in (429, 500, 502, 503, 504) or attempt == 3:
@@ -655,11 +762,13 @@ class TextChat:
                         time.sleep(1.5 * (2 ** attempt))
 
             ensure_active()
-            response_steps = list(interaction.steps or [])
+            response_steps = list(getattr(interaction, "steps", None) or [])
             # Preserve the provider's native steps so later Gemini calls can reuse this history.
             turn_steps.extend(step.model_dump() for step in response_steps)
-            function_calls = [step for step in response_steps if step.type == "function_call"]
-            response = interaction.output_text or ""
+            function_calls = [step for step in response_steps if getattr(step, "type", None) == "function_call"]
+            response = getattr(interaction, "output_text", None) or self._interaction_step_text(response_steps)
+            if not response and round_text:
+                response = "".join(round_text)
             if not function_calls:
                 break
 
@@ -698,7 +807,9 @@ class TextChat:
                 raise KeyError("Chat does not exist")
             previous_turns = list(current_chat["turns"])
             previous_title = current_chat["title"]
+            previous_updated_at = current_chat.get("updated_at")
             current_chat["turns"] = [*previous_turns, new_turn][-MAX_TURNS:]
+            current_chat["updated_at"] = datetime.now(timezone.utc).isoformat()
             if current_chat["title"] == "New chat":
                 current_chat["title"] = " ".join(message.split())[:36] or "New chat"
             try:
@@ -707,5 +818,58 @@ class TextChat:
                 # Roll back memory so the UI does not show a turn that was not saved.
                 current_chat["turns"] = previous_turns
                 current_chat["title"] = previous_title
+                if previous_updated_at is not None:
+                    current_chat["updated_at"] = previous_updated_at
                 raise
         return response
+
+    @staticmethod
+    def _interaction_input(steps):
+        """Expand local attachment references into Interactions multimodal content."""
+        expanded = []
+        for step in steps:
+            record = dict(step)
+            if step.get("type") == "user_input":
+                content = []
+                for item in step.get("content", []):
+                    if item.get("type") != "attachment":
+                        content.append(item)
+                        continue
+                    if not re.fullmatch(r"[a-f0-9]{32}\.[a-z0-9]{1,8}", str(item.get("id", ""))):
+                        raise ValueError("Saved attachment reference is invalid.")
+                    file_path = UPLOAD_DIR / item["id"]
+                    attachment_text = TextChat._read_text_attachment(item, file_path)
+                    if attachment_text is not None:
+                        content.append({"type": "text", "text": attachment_text})
+                    else:
+                        content.append({
+                            "type": "image" if item["mime_type"].startswith("image/") else "document",
+                            "mime_type": item["mime_type"],
+                            "data": base64.b64encode(file_path.read_bytes()).decode("ascii"),
+                        })
+                record["content"] = content
+            expanded.append(record)
+        return expanded
+
+    @staticmethod
+    def _read_text_attachment(item, file_path):
+        """Decode textual attachments for APIs that reject text/plain documents."""
+        if file_path.suffix.lower() not in TEXT_UPLOAD_EXTENSIONS:
+            return None
+        raw_text = file_path.read_bytes().decode("utf-8-sig", errors="replace")
+        if len(raw_text) > MAX_TEXT_ATTACHMENT_CHARS:
+            raw_text = raw_text[:MAX_TEXT_ATTACHMENT_CHARS] + "\n[File content truncated.]"
+        return f"[Attached file: {item.get('name', file_path.name)}]\n{raw_text}"
+
+    @staticmethod
+    def _interaction_step_text(steps):
+        """Recover assistant text from streamed interactions, which omit output_text."""
+        chunks = []
+        for step in steps:
+            if getattr(step, "type", None) != "model_output":
+                continue
+            for part in getattr(step, "content", None) or []:
+                value = getattr(part, "text", None)
+                if value:
+                    chunks.append(value)
+        return "".join(chunks)
