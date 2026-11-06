@@ -1,4 +1,0 @@
-google-genai
-pyaudio
-python-socks[asyncio]
-pywebrtc-audio
